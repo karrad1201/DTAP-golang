@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "${SERVER_PORT}:${SERVER_PORT}"
+    environment:
+      # JWT Configuration
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      
+      # Redis Configuration
+      - REDIS_URL=redis-server:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      
+      # Database Configuration
+      - SQLITE_PATH=/app/data/gjwt_data.db
+      
+      # Token TTL Configuration
+      - GJWT_TTL=${GJWT_TTL}
+      - IP_CHECK_TTL=${IP_CHECK_TTL}
+      - REISSUE_IP_TTL=${REISSUE_IP_TTL}
+      - SYNC_INTERVAL=${SYNC_INTERVAL}
+      
+      # Server Configuration
+      - SERVER_PORT=${SERVER_PORT}
+    volumes:
+      - gjwt_data:/app/data
+      - public_files:/app/public/files
+    depends_on:
+      - redis-server
+    restart: unless-stopped
+
+  redis-server:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly
+    ports:
+      - "6379:6379"
+    command: [ "--requirepass=${REDIS_PASSWORD}" ]
+    restart: unless-stopped
+
+volumes:
+  gjwt_data:
+  public_files:

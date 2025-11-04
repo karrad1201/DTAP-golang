@@ -1,0 +1,20 @@
+# Environment files
+.env
+*.env.local
+*.env.production
+
+# Database files
+*.db
+*.db-journal
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Binaries
+/dist/
+/bin/
