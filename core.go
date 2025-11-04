@@ -77,43 +77,51 @@ func refreshCacheFromRedis() {
 	}
 
 	log.Println("🔄 Starting cache refresh from Redis...")
-
 	newCache := &sync.Map{}
-
-	keys, err := redisClient.Keys(ctx, "gjwt:*").Result()
-	if err != nil {
-		log.Printf("❌ Error getting keys for cache refresh: %v", err)
-		return
-	}
-
 	var loadedCount int
-	for _, key := range keys {
-		token, err := redisClient.Get(ctx, key).Result()
+
+	var cursor uint64
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = redisClient.Scan(ctx, cursor, "gjwt:*", 100).Result()
 		if err != nil {
-			continue
+			log.Printf("❌ Error scanning keys: %v", err)
+			break
 		}
 
-		parts := strings.Split(key, ":")
-		if len(parts) != 3 {
-			continue
+		for _, key := range keys {
+			token, err := redisClient.Get(ctx, key).Result()
+			if err != nil {
+				continue
+			}
+
+			parts := strings.Split(key, ":")
+			if len(parts) != 3 {
+				continue
+			}
+
+			user := parts[1]
+			device := parts[2]
+			cacheKey := user + ":" + device
+
+			ttl, err := redisClient.TTL(ctx, key).Result()
+			if err != nil {
+				continue
+			}
+
+			newCache.Store(cacheKey, GJWTData{
+				Token:     token,
+				User:      user,
+				Device:    device,
+				ExpiresAt: time.Now().Add(ttl),
+			})
+			loadedCount++
 		}
 
-		user := parts[1]
-		device := parts[2]
-		cacheKey := user + ":" + device
-
-		ttl, err := redisClient.TTL(ctx, key).Result()
-		if err != nil {
-			continue
+		if cursor == 0 {
+			break
 		}
-
-		newCache.Store(cacheKey, GJWTData{
-			Token:     token,
-			User:      user,
-			Device:    device,
-			ExpiresAt: time.Now().Add(ttl),
-		})
-		loadedCount++
 	}
 
 	cacheMutex.Lock()
@@ -156,8 +164,8 @@ func initRedis() {
 		Addr:         redisURL,
 		Password:     os.Getenv("REDIS_PASSWORD"),
 		DB:           0,
-		PoolSize:     100,
-		MinIdleConns: 10,
+		PoolSize:     300,
+		MinIdleConns: 50,
 		MaxRetries:   3,
 		ReadTimeout:  time.Second,
 		WriteTimeout: time.Second,
@@ -296,13 +304,13 @@ func loadGJWTFromSQLite() error {
 
 		loadedCount++
 	}
+	defer sqliteDB.Close()
 
 	log.Printf("Loaded %d GJWT tokens from SQLite", loadedCount)
 	return nil
 }
 
 func GetOrCreateLJWT(user, device, clientIP, country string) (*LJWTResponse, error) {
-	log.Printf("🎯 GetOrCreateLJWT: user=%s, device=%s", user, device)
 
 	existingGJWT, err := findExistingGJWT(user, device)
 	if err != nil {
@@ -313,11 +321,9 @@ func GetOrCreateLJWT(user, device, clientIP, country string) (*LJWTResponse, err
 	var isNew bool
 
 	if existingGJWT != "" {
-		log.Printf("🔍 Using existing GJWT for user=%s, device=%s", user, device)
 		gjwt = existingGJWT
 		isNew = false
 	} else {
-		log.Printf("🆕 Creating new GJWT for user=%s, device=%s", user, device)
 		gjwt = CreateGJWT(user, device)
 		if gjwt == "" {
 			return nil, fmt.Errorf("failed to create GJWT")
@@ -346,7 +352,6 @@ func GetOrCreateLJWT(user, device, clientIP, country string) (*LJWTResponse, err
 		response.Message = "LJWT reissued using existing GJWT"
 	}
 
-	log.Printf("✅ GetOrCreateLJWT success: user=%s, isNew=%v", user, isNew)
 	return response, nil
 }
 
@@ -354,7 +359,6 @@ func findExistingGJWT(user, device string) (string, error) {
 	cacheKey := user + ":" + device
 
 	if cached := gjwtCache.get(cacheKey); cached != "" {
-		log.Printf("🔍 Found GJWT in cache for user=%s", user)
 		return cached, nil
 	}
 
@@ -362,33 +366,11 @@ func findExistingGJWT(user, device string) (string, error) {
 		key := fmt.Sprintf("gjwt:%s:%s", user, device)
 		storedGJWT, err := redisClient.Get(ctx, key).Result()
 		if err == nil && storedGJWT != "" {
-			log.Printf("🔍 Found GJWT in Redis for user=%s", user)
 			gjwtCache.set(cacheKey, storedGJWT, GJWT_TTL)
 			return storedGJWT, nil
 		}
 	}
 
-	if sqliteDB != nil {
-		var token string
-		var expiresAt time.Time
-
-		err := sqliteDB.QueryRow(`
-					SELECT token, expires_at 
-					FROM gjwt_tokens 
-					WHERE user_id = ? AND device_id = ? AND expires_at > datetime('now')
-			`, user, device).Scan(&token, &expiresAt)
-
-		if err == nil && token != "" {
-			log.Printf("🔍 Found GJWT in SQLite for user=%s", user)
-			gjwtCache.set(cacheKey, token, time.Until(expiresAt))
-			if redisClient != nil {
-				redisClient.Set(ctx, fmt.Sprintf("gjwt:%s:%s", user, device), token, time.Until(expiresAt))
-			}
-			return token, nil
-		}
-	}
-
-	log.Printf("🔍 No existing GJWT found for user=%s, device=%s", user, device)
 	return "", nil
 }
 
@@ -417,13 +399,11 @@ func CreateGJWT(user string, device string) string {
 func CreateLJWT(ip string, country string, device string, exp string, GJWT string) string {
 	gjwtDevice, err := getDeviceFromGJWT(GJWT)
 	if err != nil || gjwtDevice != device {
-		fmt.Printf("Device change detected: %s -> %s. Removing GJWT.\n", gjwtDevice, device)
 		RemoveGJWTFromStorage(GJWT)
 		return ""
 	}
 
 	if !VerifyGJWTInStorage(GJWT) {
-		fmt.Printf("GJWT not found in storage. Cannot create LJWT.\n")
 		return ""
 	}
 
@@ -440,13 +420,15 @@ func CreateLJWT(ip string, country string, device string, exp string, GJWT strin
 		countryKey := fmt.Sprintf("gjwt_country:%s", GJWT)
 
 		pipe.Expire(ctx, key, GJWT_TTL)
-
 		storedIPCmd := pipe.Get(ctx, ipKey)
 		storedCountryCmd := pipe.Get(ctx, countryKey)
 
+		setCountryCmd := pipe.Set(ctx, countryKey, country, GJWT_TTL)
+		setIPCmd := pipe.Set(ctx, ipKey, ip, IP_CHECK_TTL)
+
 		_, execErr := pipe.Exec(ctx)
 		if execErr != nil && execErr != redis.Nil {
-			fmt.Printf("Redis pipeline error: %v\n", execErr)
+			return createLJWTWithoutRedis(ip, country, device, exp, GJWT)
 		}
 
 		storedIP, _ := storedIPCmd.Result()
@@ -454,32 +436,36 @@ func CreateLJWT(ip string, country string, device string, exp string, GJWT strin
 
 		if storedIP != "" {
 			if storedCountry != "" && storedCountry != country {
-				fmt.Printf("Country change detected: %s -> %s. Removing GJWT.\n", storedCountry, country)
 				RemoveGJWTFromStorage(GJWT)
 				return ""
 			}
-
 			if storedIP != ip {
-				fmt.Printf("Third IP detected: stored=%s, new=%s. Removing GJWT.\n", storedIP, ip)
 				RemoveGJWTFromStorage(GJWT)
 				return ""
 			}
-
 			if storedCountry != country {
-				redisClient.Set(ctx, countryKey, country, GJWT_TTL)
 			}
 		} else {
 			if storedCountry != "" && storedCountry != country {
-				fmt.Printf("Country change detected: %s -> %s. Removing GJWT.\n", storedCountry, country)
 				RemoveGJWTFromStorage(GJWT)
 				return ""
 			}
-
-			pipe = redisClient.Pipeline()
-			pipe.Set(ctx, countryKey, country, GJWT_TTL)
-			pipe.Set(ctx, ipKey, ip, IP_CHECK_TTL)
-			pipe.Exec(ctx)
 		}
+
+		_, _ = setCountryCmd.Result()
+		_, _ = setIPCmd.Result()
+	}
+
+	payload := generatePayloadLJWT(ip, country, exp)
+	signature := generateLJWTsignature(payload, GJWT)
+	header := generateLJWTheader(GJWT)
+	return header + "." + payload + "." + signature
+}
+
+func createLJWTWithoutRedis(ip, country, device, exp, GJWT string) string {
+	gjwtDevice, err := getDeviceFromGJWT(GJWT)
+	if err != nil || gjwtDevice != device {
+		return ""
 	}
 
 	payload := generatePayloadLJWT(ip, country, exp)
@@ -489,11 +475,9 @@ func CreateLJWT(ip string, country string, device string, exp string, GJWT strin
 }
 
 func VerifyLJWT(token string, currentIP string, currentDevice string, currentCountry string) string {
-	log.Printf("🔐 Starting LJWT verification...")
 
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		log.Printf("❌ Invalid token format: expected 3 parts, got %d", len(parts))
 		return CreateNewLJWT("", "", "", "Invalid token format", currentIP, currentDevice, currentCountry)
 	}
 
@@ -514,8 +498,6 @@ func VerifyLJWT(token string, currentIP string, currentDevice string, currentCou
 		log.Printf("❌ GJWT not found in LJWT header")
 		return CreateNewLJWT("", "", "", "GJWT not found in header", currentIP, currentDevice, currentCountry)
 	}
-
-	log.Printf("🔍 Extracted GJWT from LJWT: %s...", gjwt[:20])
 
 	gjwtDevice, err := getDeviceFromGJWT(gjwt)
 	if err != nil {
@@ -572,7 +554,6 @@ func VerifyLJWT(token string, currentIP string, currentDevice string, currentCou
 	}
 
 	if !checkExpiration(exp) {
-		log.Printf("🔄 Token expired, attempting reissue...")
 		ip := payload["ip"]
 		country := payload["cnt"]
 
@@ -581,7 +562,6 @@ func VerifyLJWT(token string, currentIP string, currentDevice string, currentCou
 			storedIP, err := redisClient.Get(ctx, reissueIPKey).Result()
 
 			if err == nil && storedIP != "" && storedIP != currentIP {
-				log.Printf("🚨 Suspicious reissue: IP changed from %s to %s", storedIP, currentIP)
 				RemoveGJWTFromStorage(gjwt)
 				return ""
 			}
@@ -592,7 +572,6 @@ func VerifyLJWT(token string, currentIP string, currentDevice string, currentCou
 		return CreateNewLJWT(ip, country, gjwt, "Token expired", currentIP, currentDevice, currentCountry)
 	}
 
-	log.Printf("✅ LJWT verification successful")
 	return gjwt
 }
 
@@ -624,7 +603,6 @@ func CreateNewLJWT(ip, country, gjwt, reason, currentIP, currentDevice, currentC
 }
 
 func extractUserDeviceFromGJWT(gjwt string) (string, string, error) {
-	log.Printf("🔍 Starting GJWT extraction: %s...", gjwt[:50])
 
 	parts := strings.Split(gjwt, ".")
 	if len(parts) != 3 {
@@ -650,32 +628,25 @@ func extractUserDeviceFromGJWT(gjwt string) (string, string, error) {
 		}
 	}
 
-	log.Printf("🔍 GJWT Payload JSON: %s", string(payloadJSON))
-
 	var payload map[string]interface{}
 	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
 		return "", "", fmt.Errorf("failed to unmarshal payload: %v", err)
 	}
 
-	log.Printf("🔍 GJWT Payload fields: %+v", payload)
-
 	user, userOk := payload["sub"].(string)
 	if !userOk {
 		user, userOk = payload["user"].(string)
-		log.Printf("🔍 Trying 'user' field: %s (ok: %v)", user, userOk)
 	}
 
 	device, deviceOk := payload["dvc"].(string)
 	if !deviceOk {
 		device, deviceOk = payload["device"].(string)
-		log.Printf("🔍 Trying 'device' field: %s (ok: %v)", device, deviceOk)
 	}
 
 	if !userOk || !deviceOk {
 		return "", "", fmt.Errorf("missing user or device in GJWT payload. Fields found: %v", getMapKeys(payload))
 	}
 
-	log.Printf("✅ Successfully extracted: User=%s, Device=%s", user, device)
 	return user, device, nil
 }
 

@@ -24,7 +24,6 @@ func main() {
 		if err := loadGJWTFromSQLite(); err != nil {
 			log.Printf("⚠️ Failed to load GJWT from SQLite: %v", err)
 		}
-		go startSyncWorker()
 	}
 	if redisClient != nil {
 		go startCacheRefreshWorker()
@@ -139,25 +138,40 @@ func checkHandler(c *fiber.Ctx) error {
 func listGJWTHandler(c *fiber.Ctx) error {
 	user := c.Locals(string(UserKey)).(string)
 
-	var gjwtList []map[string]interface{}
+	if redisClient == nil {
+		return c.JSON(fiber.Map{"tokens": []string{}})
+	}
 
-	if redisClient != nil {
+	var gjwtList []map[string]interface{}
+	var cursor uint64
+
+	for {
+		var keys []string
+		var err error
 		pattern := fmt.Sprintf("gjwt:%s:*", user)
-		keys, err := redisClient.Keys(ctx, pattern).Result()
-		if err == nil {
-			for _, key := range keys {
-				token, err := redisClient.Get(ctx, key).Result()
-				if err == nil {
-					parts := strings.Split(key, ":")
-					if len(parts) == 3 {
-						device := parts[2]
-						gjwtList = append(gjwtList, map[string]interface{}{
-							"device": device,
-							"token":  token,
-						})
-					}
-				}
+		keys, cursor, err = redisClient.Scan(ctx, cursor, pattern, 50).Result()
+		if err != nil {
+			break
+		}
+
+		for _, key := range keys {
+			token, err := redisClient.Get(ctx, key).Result()
+			if err != nil {
+				continue
 			}
+
+			parts := strings.Split(key, ":")
+			if len(parts) == 3 {
+				device := parts[2]
+				gjwtList = append(gjwtList, map[string]interface{}{
+					"device": device,
+					"token":  token,
+				})
+			}
+		}
+
+		if cursor == 0 {
+			break
 		}
 	}
 
